@@ -219,11 +219,15 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request, collName st
 		return
 	}
 
-	// Get max_nodes from query parameter (default: 100)
+	// Get max_nodes from query parameter (default: 100, max: 10000)
 	maxNodes := 100
+	const maxAllowed = 10000
 	if maxStr := r.URL.Query().Get("max_nodes"); maxStr != "" {
 		if n, err := strconv.Atoi(maxStr); err == nil && n > 0 {
 			maxNodes = n
+			if maxNodes > maxAllowed {
+				maxNodes = maxAllowed
+			}
 		}
 	}
 

@@ -964,7 +964,8 @@
             let html = '';
             for (const name of collections) {
                 try {
-                    const info = await api(`/collections/${name}`);
+                    const info = await api(`/collections/${encodeURIComponent(name)}`);
+                    const escapedName = name.replace(/'/g, "\\'");
                     html += `
                         <tr>
                             <td><strong>${name}</strong></td>
@@ -972,8 +973,8 @@
                             <td><span class="badge badge-primary">${info.metric}</span></td>
                             <td>${info.count || 0}</td>
                             <td class="actions">
-                                <button class="btn btn-sm btn-secondary" onclick="viewCollection('${name}')">View</button>
-                                <button class="btn btn-sm btn-danger" onclick="deleteCollection('${name}')">Delete</button>
+                                <button class="btn btn-sm btn-secondary" onclick="viewCollection('${escapedName}')">View</button>
+                                <button class="btn btn-sm btn-danger" onclick="deleteCollection('${escapedName}')">Delete</button>
                             </td>
                         </tr>
                     `;
@@ -1003,7 +1004,7 @@
             let html = '';
             for (const name of collections) {
                 try {
-                    const info = await api(`/collections/${name}`);
+                    const info = await api(`/collections/${encodeURIComponent(name)}`);
                     totalVectors += info.count || 0;
                     const created = info.created ? new Date(info.created).toLocaleDateString() : '-';
                     html += `
@@ -1077,7 +1078,7 @@
             }
             
             try {
-                await api(`/collections/${name}`, { method: 'DELETE' });
+                await api(`/collections/${encodeURIComponent(name)}`, { method: 'DELETE' });
                 loadCollections();
                 showToast(`Collection "${name}" deleted`, 'success');
             } catch (e) {}
@@ -1106,7 +1107,7 @@
             }
             
             try {
-                const vector = await api(`/collections/${collection}/vectors?id=${encodeURIComponent(id)}`);
+                const vector = await api(`/collections/${encodeURIComponent(collection)}/vectors?id=${encodeURIComponent(id)}`);
                 showVectorDetails(vector, collection);
             } catch (e) {
                 document.getElementById('vector-results').innerHTML = `
@@ -1158,7 +1159,7 @@
             if (!confirm(`Delete vector "${id}"?`)) return;
             
             try {
-                await api(`/collections/${collection}/vectors?id=${encodeURIComponent(id)}`, {
+                await api(`/collections/${encodeURIComponent(collection)}/vectors?id=${encodeURIComponent(id)}`, {
                     method: 'DELETE'
                 });
                 closeModal('view-vector-modal');
@@ -1181,7 +1182,7 @@
             if (!currentCollection) return;
             
             try {
-                const info = await api(`/collections/${currentCollection}`);
+                const info = await api(`/collections/${encodeURIComponent(currentCollection)}`);
                 const dimension = info.dimension;
                 const values = Array.from({ length: dimension }, () => (Math.random() * 2 - 1).toFixed(6));
                 document.getElementById('new-vector-values').value = values.join(', ');
@@ -1221,7 +1222,7 @@
             }
             
             try {
-                await api(`/collections/${currentCollection}/vectors`, {
+                await api(`/collections/${encodeURIComponent(currentCollection)}/vectors`, {
                     method: 'POST',
                     body: JSON.stringify({
                         vectors: [{ id, values, metadata }]
@@ -1312,7 +1313,7 @@
             
             try {
                 const maxNodes = parseInt(document.getElementById('viz-max-nodes').value);
-                const data = await api(`/collections/${collection}/graph?max_nodes=${maxNodes}`);
+                const data = await api(`/collections/${encodeURIComponent(collection)}/graph?max_nodes=${maxNodes}`);
                 graphData = data;
                 resetView();
             } catch (e) {

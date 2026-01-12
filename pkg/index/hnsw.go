@@ -673,7 +673,8 @@ type GraphNode struct {
 }
 
 // GraphData returns graph structure data for visualization.
-// maxNodes limits the number of nodes returned (0 for all nodes).
+// If maxNodes is 0 or negative, all nodes are returned.
+// Otherwise, at most maxNodes nodes are returned.
 func (h *HNSW) GraphData(maxNodes int) map[string]any {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
