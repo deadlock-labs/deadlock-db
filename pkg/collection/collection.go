@@ -280,6 +280,9 @@ func (c *Collection) Update(id string, values []float32, metadata map[string]any
 		c.metadata[id] = metadata
 	}
 
+	// Increment version on update
+	existing.IncrementVersion()
+
 	// Store updated vector
 	if err := c.storage.Put(existing); err != nil {
 		return err
