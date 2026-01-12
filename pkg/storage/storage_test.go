@@ -267,3 +267,129 @@ func BenchmarkDiskEnginePut(b *testing.B) {
 		engine.Put(vectors[i])
 	}
 }
+
+func TestMMapEngine(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	engine, err := NewMMapEngine(tmpDir)
+	if err != nil {
+		t.Fatalf("failed to create mmap engine: %v", err)
+	}
+
+	// Test Put and Get
+	vec := core.NewVectorWithMetadata("mmap-vec-1", []float32{1, 2, 3, 4}, map[string]any{"key": "value"})
+	if err := engine.Put(vec); err != nil {
+		t.Fatalf("put failed: %v", err)
+	}
+
+	retrieved, err := engine.Get("mmap-vec-1")
+	if err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+
+	if retrieved.ID != "mmap-vec-1" {
+		t.Errorf("ID mismatch: expected 'mmap-vec-1', got '%s'", retrieved.ID)
+	}
+
+	// Test persistence
+	engine.Close()
+
+	// Reopen and verify
+	engine2, err := NewMMapEngine(tmpDir)
+	if err != nil {
+		t.Fatalf("failed to reopen mmap engine: %v", err)
+	}
+	defer engine2.Close()
+
+	retrieved2, err := engine2.Get("mmap-vec-1")
+	if err != nil {
+		t.Fatalf("get after reopen failed: %v", err)
+	}
+
+	if retrieved2.ID != "mmap-vec-1" {
+		t.Errorf("ID mismatch after reopen")
+	}
+}
+
+func TestMMapEngineIterate(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	engine, err := NewMMapEngine(tmpDir)
+	if err != nil {
+		t.Fatalf("failed to create mmap engine: %v", err)
+	}
+
+	// Insert multiple vectors
+	for i := 0; i < 10; i++ {
+		vec := core.NewVector(string(rune('a'+i)), []float32{float32(i), float32(i * 2)})
+		engine.Put(vec)
+	}
+
+	// Count iterations
+	count := 0
+	err = engine.Iterate(func(_ *core.Vector) error {
+		count++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("iterate failed: %v", err)
+	}
+
+	if count != 10 {
+		t.Errorf("expected 10 iterations, got %d", count)
+	}
+
+	engine.Close()
+}
+
+func TestMMapEngineDelete(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	engine, err := NewMMapEngine(tmpDir)
+	if err != nil {
+		t.Fatalf("failed to create mmap engine: %v", err)
+	}
+
+	// Insert and delete
+	vec := core.NewVector("to-delete-mmap", []float32{1, 2, 3})
+	engine.Put(vec)
+
+	if engine.Size() != 1 {
+		t.Errorf("expected size 1, got %d", engine.Size())
+	}
+
+	engine.Delete("to-delete-mmap")
+
+	if engine.Size() != 0 {
+		t.Errorf("expected size 0 after delete, got %d", engine.Size())
+	}
+
+	// Verify deletion
+	_, err = engine.Get("to-delete-mmap")
+	if err == nil {
+		t.Error("deleted vector should not be found")
+	}
+
+	engine.Close()
+}
+
+func BenchmarkMMapEnginePut(b *testing.B) {
+	tmpDir, _ := os.MkdirTemp("", "bench-mmap-*")
+	defer os.RemoveAll(tmpDir)
+
+	engine, err := NewMMapEngine(tmpDir)
+	if err != nil {
+		b.Fatalf("failed to create mmap engine: %v", err)
+	}
+	defer engine.Close()
+
+	vectors := make([]*core.Vector, b.N)
+	for i := 0; i < b.N; i++ {
+		vectors[i] = core.NewVector(string(rune(i)), []float32{float32(i), float32(i * 2)})
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		engine.Put(vectors[i])
+	}
+}
