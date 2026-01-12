@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -321,7 +322,7 @@ func TestMMapEngineIterate(t *testing.T) {
 
 	// Insert multiple vectors
 	for i := 0; i < 10; i++ {
-		vec := core.NewVector(string(rune('a'+i)), []float32{float32(i), float32(i * 2)})
+		vec := core.NewVector(fmt.Sprintf("mmap-iterate-%d", i), []float32{float32(i), float32(i * 2)})
 		engine.Put(vec)
 	}
 
@@ -385,7 +386,7 @@ func BenchmarkMMapEnginePut(b *testing.B) {
 
 	vectors := make([]*core.Vector, b.N)
 	for i := 0; i < b.N; i++ {
-		vectors[i] = core.NewVector(string(rune(i)), []float32{float32(i), float32(i * 2)})
+		vectors[i] = core.NewVector(fmt.Sprintf("bench-mmap-%d", i), []float32{float32(i), float32(i * 2)})
 	}
 
 	b.ResetTimer()
