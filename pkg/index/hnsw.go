@@ -664,6 +664,66 @@ func (h *HNSW) Stats() map[string]any {
 	}
 }
 
+// GraphNode represents a node in the graph visualization.
+type GraphNode struct {
+	ID          uint64   `json:"id"`
+	VectorID    string   `json:"vector_id"`
+	MaxLayer    int      `json:"max_layer"`
+	Connections []uint64 `json:"connections"`
+}
+
+// GraphData returns graph structure data for visualization.
+// If maxNodes is 0 or negative, all nodes are returned.
+// Otherwise, at most maxNodes nodes are returned.
+func (h *HNSW) GraphData(maxNodes int) map[string]any {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	nodes := make([]GraphNode, 0)
+	count := 0
+
+	// Get entry point vector ID
+	var entryPointVectorID string
+	if epNode, ok := h.nodes[h.entryPoint]; ok {
+		entryPointVectorID = epNode.VectorID
+	}
+
+	for id, node := range h.nodes {
+		if maxNodes > 0 && count >= maxNodes {
+			break
+		}
+
+		// Determine max layer for this node
+		maxLayer := 0
+		for layer, conns := range node.Connections {
+			if len(conns) > 0 && layer > maxLayer {
+				maxLayer = layer
+			}
+		}
+
+		// Get layer 0 connections (base layer has most connections)
+		var connections []uint64
+		if len(node.Connections) > 0 {
+			connections = node.Connections[0]
+		}
+
+		nodes = append(nodes, GraphNode{
+			ID:          id,
+			VectorID:    node.VectorID,
+			MaxLayer:    maxLayer,
+			Connections: connections,
+		})
+		count++
+	}
+
+	return map[string]any{
+		"nodes":       nodes,
+		"max_layer":   h.maxLayer,
+		"entry_point": entryPointVectorID,
+		"total_nodes": h.size,
+	}
+}
+
 // SearchAdaptive performs a search with adaptive ef parameter.
 // It starts with a small ef and increases if the initial results seem poor.
 // This provides a good balance between speed and recall.

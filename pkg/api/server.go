@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	deadlockdb "github.com/deadlock-labs/deadlock-db"
+	"github.com/deadlock-labs/deadlock-db/pkg/api/web"
 	"github.com/deadlock-labs/deadlock-db/pkg/core"
 	"github.com/deadlock-labs/deadlock-db/pkg/distance"
 	"github.com/deadlock-labs/deadlock-db/pkg/filter"
@@ -33,10 +35,31 @@ func NewServer(db *deadlockdb.DB, addr string) *Server {
 
 // setupRoutes configures the HTTP routes.
 func (s *Server) setupRoutes() {
+	// Web UI
+	s.mux.HandleFunc("/", s.handleWebUI)
+
+	// API endpoints
 	s.mux.HandleFunc("/health", s.handleHealth)
 	s.mux.HandleFunc("/version", s.handleVersion)
 	s.mux.HandleFunc("/collections", s.handleCollections)
 	s.mux.HandleFunc("/collections/", s.handleCollection)
+}
+
+// handleWebUI serves the web UI.
+func (s *Server) handleWebUI(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+
+	content, err := web.Templates.ReadFile("templates/index.html")
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "failed to load UI")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(content)
 }
 
 // Start starts the HTTP server.
@@ -97,6 +120,8 @@ func (s *Server) handleCollection(w http.ResponseWriter, r *http.Request) {
 		s.handleVectors(w, r, collName)
 	case "search":
 		s.handleSearch(w, r, collName)
+	case "graph":
+		s.handleGraph(w, r, collName)
 	default:
 		s.writeError(w, http.StatusNotFound, "unknown operation")
 	}
@@ -179,6 +204,35 @@ func (s *Server) deleteCollection(w http.ResponseWriter, _ *http.Request, collNa
 	}
 
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// handleGraph returns graph visualization data for a collection.
+func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request, collName string) {
+	if r.Method != http.MethodGet {
+		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	coll, err := s.db.GetCollection(collName)
+	if err != nil {
+		s.writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	// Get max_nodes from query parameter (default: 100, max: 10000)
+	maxNodes := 100
+	const maxAllowed = 10000
+	if maxStr := r.URL.Query().Get("max_nodes"); maxStr != "" {
+		if n, err := strconv.Atoi(maxStr); err == nil && n > 0 {
+			maxNodes = n
+			if maxNodes > maxAllowed {
+				maxNodes = maxAllowed
+			}
+		}
+	}
+
+	graphData := coll.GraphData(maxNodes)
+	s.writeJSON(w, http.StatusOK, graphData)
 }
 
 // handleVectors handles vector CRUD operations.
