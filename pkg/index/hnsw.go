@@ -1,0 +1,532 @@
+// Package index provides indexing algorithms for fast approximate nearest neighbor search.
+package index
+
+import (
+	"container/heap"
+	"math"
+	"math/rand"
+	"sync"
+	"sync/atomic"
+
+	"github.com/deadlock-labs/deadlock-db/pkg/core"
+	"github.com/deadlock-labs/deadlock-db/pkg/distance"
+)
+
+// HNSWConfig contains configuration for the HNSW index.
+type HNSWConfig struct {
+	// M is the maximum number of connections per node per layer.
+	M int
+	// EfConstruction is the size of the dynamic candidate list during construction.
+	EfConstruction int
+	// Ml is the level multiplier (controls layer distribution).
+	Ml float64
+	// MaxLevel is the maximum level in the graph.
+	MaxLevel int
+	// Metric is the distance metric to use.
+	Metric distance.Metric
+	// Dimension is the vector dimension.
+	Dimension int
+}
+
+// DefaultHNSWConfig returns the default HNSW configuration.
+func DefaultHNSWConfig(dimension int) *HNSWConfig {
+	return &HNSWConfig{
+		M:              16,
+		EfConstruction: 200,
+		Ml:             1.0 / math.Log(16),
+		MaxLevel:       16,
+		Metric:         distance.Cosine,
+		Dimension:      dimension,
+	}
+}
+
+// HNSWNode represents a node in the HNSW graph.
+type HNSWNode struct {
+	ID          uint64
+	VectorID    string
+	Vector      []float32
+	Connections [][]uint64 // Connections per layer
+	mu          sync.RWMutex
+}
+
+// NewHNSWNode creates a new HNSW node.
+func NewHNSWNode(id uint64, vectorID string, vector []float32, maxLevel int) *HNSWNode {
+	return &HNSWNode{
+		ID:          id,
+		VectorID:    vectorID,
+		Vector:      vector,
+		Connections: make([][]uint64, maxLevel+1),
+	}
+}
+
+// HNSW implements the Hierarchical Navigable Small World graph for ANN search.
+type HNSW struct {
+	config     *HNSWConfig
+	nodes      map[uint64]*HNSWNode
+	vectorToID map[string]uint64
+	entryPoint uint64
+	maxLayer   int
+	size       uint64
+	nextID     uint64
+	calc       distance.Calculator
+	mu         sync.RWMutex
+}
+
+// NewHNSW creates a new HNSW index with the given configuration.
+func NewHNSW(config *HNSWConfig) *HNSW {
+	if config == nil {
+		config = DefaultHNSWConfig(128)
+	}
+	return &HNSW{
+		config:     config,
+		nodes:      make(map[uint64]*HNSWNode),
+		vectorToID: make(map[string]uint64),
+		entryPoint: 0,
+		maxLayer:   -1,
+		calc:       distance.NewCalculator(config.Metric),
+	}
+}
+
+// Size returns the number of vectors in the index.
+func (h *HNSW) Size() int {
+	return int(atomic.LoadUint64(&h.size))
+}
+
+// randomLevel generates a random level for a new node.
+func (h *HNSW) randomLevel() int {
+	level := 0
+	for level < h.config.MaxLevel && rand.Float64() < h.config.Ml {
+		level++
+	}
+	return level
+}
+
+// Insert adds a vector to the index.
+func (h *HNSW) Insert(v *core.Vector) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Check if vector already exists
+	if _, exists := h.vectorToID[v.ID]; exists {
+		return h.update(v)
+	}
+
+	nodeID := atomic.AddUint64(&h.nextID, 1) - 1
+	level := h.randomLevel()
+	node := NewHNSWNode(nodeID, v.ID, v.Values, level)
+
+	// If this is the first node
+	if h.size == 0 {
+		h.nodes[nodeID] = node
+		h.vectorToID[v.ID] = nodeID
+		h.entryPoint = nodeID
+		h.maxLayer = level
+		atomic.AddUint64(&h.size, 1)
+		return nil
+	}
+
+	// Find entry point for each layer
+	ep := h.entryPoint
+	epNode := h.nodes[ep]
+
+	// Start from top layer and go down
+	for lc := h.maxLayer; lc > level; lc-- {
+		changed := true
+		for changed {
+			changed = false
+			if epNode.Connections == nil || lc >= len(epNode.Connections) {
+				break
+			}
+			for _, neighborID := range epNode.Connections[lc] {
+				neighbor := h.nodes[neighborID]
+				if neighbor == nil {
+					continue
+				}
+				if h.calc.Distance(v.Values, neighbor.Vector) < h.calc.Distance(v.Values, epNode.Vector) {
+					ep = neighborID
+					epNode = neighbor
+					changed = true
+				}
+			}
+		}
+	}
+
+	// Insert at each layer from level down to 0
+	for lc := min(level, h.maxLayer); lc >= 0; lc-- {
+		neighbors := h.searchLayer(v.Values, ep, h.config.EfConstruction, lc)
+		selectedNeighbors := h.selectNeighbors(v.Values, neighbors, h.config.M, lc)
+
+		// Connect the new node to selected neighbors
+		node.Connections[lc] = make([]uint64, len(selectedNeighbors))
+		for i, n := range selectedNeighbors {
+			node.Connections[lc][i] = n.nodeID
+		}
+
+		// Connect neighbors back to the new node
+		for _, n := range selectedNeighbors {
+			neighbor := h.nodes[n.nodeID]
+			if neighbor == nil {
+				continue
+			}
+			neighbor.mu.Lock()
+			if lc < len(neighbor.Connections) {
+				neighbor.Connections[lc] = append(neighbor.Connections[lc], nodeID)
+				// Prune if too many connections
+				if len(neighbor.Connections[lc]) > h.config.M*2 {
+					neighbor.Connections[lc] = h.pruneConnections(neighbor, lc, h.config.M*2)
+				}
+			}
+			neighbor.mu.Unlock()
+		}
+
+		if len(neighbors) > 0 {
+			ep = neighbors[0].nodeID
+		}
+	}
+
+	h.nodes[nodeID] = node
+	h.vectorToID[v.ID] = nodeID
+
+	if level > h.maxLayer {
+		h.maxLayer = level
+		h.entryPoint = nodeID
+	}
+
+	atomic.AddUint64(&h.size, 1)
+	return nil
+}
+
+// update replaces an existing vector in the index.
+func (h *HNSW) update(v *core.Vector) error {
+	nodeID, exists := h.vectorToID[v.ID]
+	if !exists {
+		return nil
+	}
+	node := h.nodes[nodeID]
+	if node != nil {
+		node.Vector = v.Values
+	}
+	return nil
+}
+
+// Delete removes a vector from the index.
+func (h *HNSW) Delete(vectorID string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	nodeID, exists := h.vectorToID[vectorID]
+	if !exists {
+		return nil
+	}
+
+	node := h.nodes[nodeID]
+	if node == nil {
+		return nil
+	}
+
+	// Remove connections to this node from all neighbors
+	for lc := 0; lc < len(node.Connections); lc++ {
+		for _, neighborID := range node.Connections[lc] {
+			neighbor := h.nodes[neighborID]
+			if neighbor == nil {
+				continue
+			}
+			neighbor.mu.Lock()
+			if lc < len(neighbor.Connections) {
+				newConnections := make([]uint64, 0, len(neighbor.Connections[lc]))
+				for _, id := range neighbor.Connections[lc] {
+					if id != nodeID {
+						newConnections = append(newConnections, id)
+					}
+				}
+				neighbor.Connections[lc] = newConnections
+			}
+			neighbor.mu.Unlock()
+		}
+	}
+
+	delete(h.nodes, nodeID)
+	delete(h.vectorToID, vectorID)
+	atomic.AddUint64(&h.size, ^uint64(0)) // Decrement
+
+	// Update entry point if necessary
+	if h.entryPoint == nodeID && len(h.nodes) > 0 {
+		for id := range h.nodes {
+			h.entryPoint = id
+			break
+		}
+	}
+
+	return nil
+}
+
+// candidate represents a candidate node during search.
+type candidate struct {
+	nodeID   uint64
+	distance float32
+}
+
+// candidateHeap implements a min-heap for candidates.
+type candidateHeap []candidate
+
+func (h candidateHeap) Len() int           { return len(h) }
+func (h candidateHeap) Less(i, j int) bool { return h[i].distance < h[j].distance }
+func (h candidateHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+
+func (h *candidateHeap) Push(x any) {
+	*h = append(*h, x.(candidate))
+}
+
+func (h *candidateHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
+// maxCandidateHeap implements a max-heap for candidates (for ef results).
+type maxCandidateHeap []candidate
+
+func (h maxCandidateHeap) Len() int           { return len(h) }
+func (h maxCandidateHeap) Less(i, j int) bool { return h[i].distance > h[j].distance }
+func (h maxCandidateHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+
+func (h *maxCandidateHeap) Push(x any) {
+	*h = append(*h, x.(candidate))
+}
+
+func (h *maxCandidateHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
+// searchLayer performs a greedy search at a single layer.
+func (h *HNSW) searchLayer(query []float32, ep uint64, ef int, layer int) []candidate {
+	epNode := h.nodes[ep]
+	if epNode == nil {
+		return nil
+	}
+
+	visited := make(map[uint64]bool)
+	visited[ep] = true
+
+	candidates := &candidateHeap{}
+	results := &maxCandidateHeap{}
+
+	d := h.calc.Distance(query, epNode.Vector)
+	heap.Push(candidates, candidate{ep, d})
+	heap.Push(results, candidate{ep, d})
+
+	for candidates.Len() > 0 {
+		c := heap.Pop(candidates).(candidate)
+
+		// Check if we've found enough results
+		if results.Len() > 0 && c.distance > (*results)[0].distance {
+			break
+		}
+
+		cNode := h.nodes[c.nodeID]
+		if cNode == nil || layer >= len(cNode.Connections) {
+			continue
+		}
+
+		for _, neighborID := range cNode.Connections[layer] {
+			if visited[neighborID] {
+				continue
+			}
+			visited[neighborID] = true
+
+			neighbor := h.nodes[neighborID]
+			if neighbor == nil {
+				continue
+			}
+
+			dist := h.calc.Distance(query, neighbor.Vector)
+
+			if results.Len() < ef || dist < (*results)[0].distance {
+				heap.Push(candidates, candidate{neighborID, dist})
+				heap.Push(results, candidate{neighborID, dist})
+				if results.Len() > ef {
+					heap.Pop(results)
+				}
+			}
+		}
+	}
+
+	// Convert results to slice
+	result := make([]candidate, results.Len())
+	for i := results.Len() - 1; i >= 0; i-- {
+		result[i] = heap.Pop(results).(candidate)
+	}
+
+	return result
+}
+
+// selectNeighbors selects the best neighbors for a node using simple heuristic.
+func (h *HNSW) selectNeighbors(query []float32, candidates []candidate, m int, _ int) []candidate {
+	if len(candidates) <= m {
+		return candidates
+	}
+
+	// Sort by distance and take top M
+	selected := make([]candidate, 0, m)
+	for _, c := range candidates {
+		if len(selected) >= m {
+			break
+		}
+		selected = append(selected, c)
+	}
+
+	return selected
+}
+
+// pruneConnections reduces the number of connections to maxConnections.
+func (h *HNSW) pruneConnections(node *HNSWNode, layer int, maxConnections int) []uint64 {
+	if layer >= len(node.Connections) || len(node.Connections[layer]) <= maxConnections {
+		return node.Connections[layer]
+	}
+
+	// Calculate distances to all neighbors
+	type neighborDist struct {
+		id   uint64
+		dist float32
+	}
+	neighbors := make([]neighborDist, 0, len(node.Connections[layer]))
+	for _, id := range node.Connections[layer] {
+		n := h.nodes[id]
+		if n == nil {
+			continue
+		}
+		neighbors = append(neighbors, neighborDist{
+			id:   id,
+			dist: h.calc.Distance(node.Vector, n.Vector),
+		})
+	}
+
+	// Sort by distance
+	for i := 0; i < len(neighbors)-1; i++ {
+		for j := i + 1; j < len(neighbors); j++ {
+			if neighbors[j].dist < neighbors[i].dist {
+				neighbors[i], neighbors[j] = neighbors[j], neighbors[i]
+			}
+		}
+	}
+
+	// Keep only the closest
+	result := make([]uint64, 0, maxConnections)
+	for i := 0; i < len(neighbors) && i < maxConnections; i++ {
+		result = append(result, neighbors[i].id)
+	}
+
+	return result
+}
+
+// Search finds the k nearest neighbors to the query vector.
+func (h *HNSW) Search(query []float32, k int, ef int) []core.SearchResult {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if h.size == 0 {
+		return nil
+	}
+
+	if ef < k {
+		ef = k
+	}
+
+	ep := h.entryPoint
+	epNode := h.nodes[ep]
+	if epNode == nil {
+		return nil
+	}
+
+	// Traverse from top to layer 1
+	for lc := h.maxLayer; lc > 0; lc-- {
+		changed := true
+		for changed {
+			changed = false
+			if epNode.Connections == nil || lc >= len(epNode.Connections) {
+				break
+			}
+			for _, neighborID := range epNode.Connections[lc] {
+				neighbor := h.nodes[neighborID]
+				if neighbor == nil {
+					continue
+				}
+				if h.calc.Distance(query, neighbor.Vector) < h.calc.Distance(query, epNode.Vector) {
+					ep = neighborID
+					epNode = neighbor
+					changed = true
+				}
+			}
+		}
+	}
+
+	// Search at layer 0 with ef
+	candidates := h.searchLayer(query, ep, ef, 0)
+
+	// Return top k results
+	results := make([]core.SearchResult, 0, k)
+	for i := 0; i < len(candidates) && i < k; i++ {
+		node := h.nodes[candidates[i].nodeID]
+		if node == nil {
+			continue
+		}
+		score := candidates[i].distance
+		// Convert distance to similarity score if needed
+		if h.config.Metric == distance.DotProduct {
+			score = -score // Negate back to positive
+		}
+		results = append(results, core.SearchResult{
+			ID:    node.VectorID,
+			Score: score,
+		})
+	}
+
+	return results
+}
+
+// GetVector retrieves a vector by its ID.
+func (h *HNSW) GetVector(vectorID string) (*core.Vector, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	nodeID, exists := h.vectorToID[vectorID]
+	if !exists {
+		return nil, false
+	}
+
+	node := h.nodes[nodeID]
+	if node == nil {
+		return nil, false
+	}
+
+	return core.NewVector(vectorID, node.Vector), true
+}
+
+// Stats returns statistics about the index.
+func (h *HNSW) Stats() map[string]any {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	totalConnections := 0
+	for _, node := range h.nodes {
+		for _, conns := range node.Connections {
+			totalConnections += len(conns)
+		}
+	}
+
+	return map[string]any{
+		"size":              h.size,
+		"max_layer":         h.maxLayer,
+		"entry_point":       h.entryPoint,
+		"total_connections": totalConnections,
+		"m":                 h.config.M,
+		"ef_construction":   h.config.EfConstruction,
+		"metric":            h.config.Metric.String(),
+	}
+}
