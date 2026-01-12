@@ -428,6 +428,14 @@ func (c *Collection) Stats() map[string]any {
 	}
 }
 
+// GraphData returns the HNSW graph structure for visualization.
+func (c *Collection) GraphData(maxNodes int) map[string]any {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.index.GraphData(maxNodes)
+}
+
 // Export exports the collection to a file.
 func (c *Collection) Export(path string) error {
 	c.mu.RLock()
