@@ -26,6 +26,9 @@ type HNSWConfig struct {
 	Metric distance.Metric
 	// Dimension is the vector dimension.
 	Dimension int
+	// UseHeuristic enables the improved RNG-based neighbor selection heuristic.
+	// This improves recall at the cost of slightly slower insertion.
+	UseHeuristic bool
 }
 
 // DefaultHNSWConfig returns the default HNSW configuration.
@@ -37,6 +40,7 @@ func DefaultHNSWConfig(dimension int) *HNSWConfig {
 		MaxLevel:       16,
 		Metric:         distance.Cosine,
 		Dimension:      dimension,
+		UseHeuristic:   true, // Enable improved neighbor selection by default
 	}
 }
 
@@ -366,25 +370,105 @@ func (h *HNSW) searchLayer(query []float32, ep uint64, ef int, layer int) []cand
 	return result
 }
 
-// selectNeighbors selects the best neighbors for a node using simple heuristic.
+// selectNeighbors selects the best neighbors for a node.
+// Uses RNG-based heuristic when enabled for better graph quality.
 func (h *HNSW) selectNeighbors(query []float32, candidates []candidate, m int, _ int) []candidate {
 	if len(candidates) <= m {
 		return candidates
 	}
 
-	// Sort by distance and take top M
-	selected := make([]candidate, 0, m)
-	for _, c := range candidates {
-		if len(selected) >= m {
-			break
+	if !h.config.UseHeuristic {
+		// Simple selection: just take top M by distance
+		selected := make([]candidate, 0, m)
+		for _, c := range candidates {
+			if len(selected) >= m {
+				break
+			}
+			selected = append(selected, c)
 		}
-		selected = append(selected, c)
+		return selected
+	}
+
+	// RNG-based heuristic: select neighbors that are close to query
+	// but not too close to each other, promoting graph diversity
+	return h.selectNeighborsHeuristic(query, candidates, m)
+}
+
+// selectNeighborsHeuristic implements the RNG-based neighbor selection.
+// This produces a more navigable graph by avoiding clusters of similar neighbors.
+func (h *HNSW) selectNeighborsHeuristic(query []float32, candidates []candidate, m int) []candidate {
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	selected := make([]candidate, 0, m)
+	// Working set starts with all candidates
+	working := make([]candidate, len(candidates))
+	copy(working, candidates)
+
+	for len(selected) < m && len(working) > 0 {
+		// Find the closest candidate to query
+		minIdx := 0
+		for i := 1; i < len(working); i++ {
+			if working[i].distance < working[minIdx].distance {
+				minIdx = i
+			}
+		}
+		closest := working[minIdx]
+
+		// Remove from working set
+		working[minIdx] = working[len(working)-1]
+		working = working[:len(working)-1]
+
+		// Check if this candidate is a good addition (RNG condition)
+		// A candidate is good if it's not dominated by existing selected neighbors
+		good := true
+		closestNode := h.nodes[closest.nodeID]
+		if closestNode != nil {
+			for _, sel := range selected {
+				selNode := h.nodes[sel.nodeID]
+				if selNode == nil {
+					continue
+				}
+				// If distance(closest, sel) < distance(query, closest),
+				// then 'sel' dominates 'closest' for this query
+				distToSel := h.calc.Distance(closestNode.Vector, selNode.Vector)
+				if distToSel < closest.distance {
+					good = false
+					break
+				}
+			}
+		}
+
+		if good {
+			selected = append(selected, closest)
+		}
+	}
+
+	// If we couldn't fill M neighbors with the heuristic, fill with remaining best
+	if len(selected) < m && len(candidates) > len(selected) {
+		for _, c := range candidates {
+			if len(selected) >= m {
+				break
+			}
+			found := false
+			for _, s := range selected {
+				if s.nodeID == c.nodeID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				selected = append(selected, c)
+			}
+		}
 	}
 
 	return selected
 }
 
 // pruneConnections reduces the number of connections to maxConnections.
+// Uses the same heuristic as selectNeighbors for consistency.
 func (h *HNSW) pruneConnections(node *HNSWNode, layer int, maxConnections int) []uint64 {
 	if layer >= len(node.Connections) || len(node.Connections[layer]) <= maxConnections {
 		return node.Connections[layer]
@@ -416,10 +500,58 @@ func (h *HNSW) pruneConnections(node *HNSWNode, layer int, maxConnections int) [
 		}
 	}
 
-	// Keep only the closest
+	if !h.config.UseHeuristic {
+		// Simple: keep only the closest
+		result := make([]uint64, 0, maxConnections)
+		for i := 0; i < len(neighbors) && i < maxConnections; i++ {
+			result = append(result, neighbors[i].id)
+		}
+		return result
+	}
+
+	// RNG heuristic: select diverse neighbors
 	result := make([]uint64, 0, maxConnections)
-	for i := 0; i < len(neighbors) && i < maxConnections; i++ {
-		result = append(result, neighbors[i].id)
+	for _, neighbor := range neighbors {
+		if len(result) >= maxConnections {
+			break
+		}
+		good := true
+		neighborNode := h.nodes[neighbor.id]
+		if neighborNode != nil {
+			for _, selID := range result {
+				selNode := h.nodes[selID]
+				if selNode == nil {
+					continue
+				}
+				distToSel := h.calc.Distance(neighborNode.Vector, selNode.Vector)
+				if distToSel < neighbor.dist {
+					good = false
+					break
+				}
+			}
+		}
+		if good {
+			result = append(result, neighbor.id)
+		}
+	}
+
+	// Fill remaining slots if needed
+	if len(result) < maxConnections {
+		for _, neighbor := range neighbors {
+			if len(result) >= maxConnections {
+				break
+			}
+			found := false
+			for _, id := range result {
+				if id == neighbor.id {
+					found = true
+					break
+				}
+			}
+			if !found {
+				result = append(result, neighbor.id)
+			}
+		}
 	}
 
 	return result
@@ -528,5 +660,285 @@ func (h *HNSW) Stats() map[string]any {
 		"m":                 h.config.M,
 		"ef_construction":   h.config.EfConstruction,
 		"metric":            h.config.Metric.String(),
+		"use_heuristic":     h.config.UseHeuristic,
 	}
+}
+
+// SearchAdaptive performs a search with adaptive ef parameter.
+// It starts with a small ef and increases if the initial results seem poor.
+// This provides a good balance between speed and recall.
+func (h *HNSW) SearchAdaptive(query []float32, k int, minRecall float32) []core.SearchResult {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if h.size == 0 {
+		return nil
+	}
+
+	// Start with ef = k * 2
+	ef := k * 2
+	maxEf := k * 20
+
+	// Do initial search
+	results := h.searchInternal(query, k, ef)
+	if len(results) < k {
+		return results
+	}
+
+	// Check if results are "good enough" by looking at score distribution
+	// If the worst score is much worse than the best, we might need more exploration
+	if len(results) >= 2 {
+		bestScore := results[0].Score
+		worstScore := results[len(results)-1].Score
+
+		// Calculate score spread (normalized)
+		var spread float32
+		if bestScore != 0 {
+			spread = (worstScore - bestScore) / bestScore
+		}
+
+		// If spread is high, increase ef and re-search
+		for spread > 0.5 && ef < maxEf {
+			ef = ef * 2
+			if ef > maxEf {
+				ef = maxEf
+			}
+			results = h.searchInternal(query, k, ef)
+
+			if len(results) >= 2 {
+				bestScore = results[0].Score
+				worstScore = results[len(results)-1].Score
+				if bestScore != 0 {
+					spread = (worstScore - bestScore) / bestScore
+				} else {
+					break
+				}
+			} else {
+				break
+			}
+		}
+	}
+
+	return results
+}
+
+// searchInternal performs search without acquiring locks (caller must hold read lock).
+func (h *HNSW) searchInternal(query []float32, k int, ef int) []core.SearchResult {
+	if ef < k {
+		ef = k
+	}
+
+	ep := h.entryPoint
+	epNode := h.nodes[ep]
+	if epNode == nil {
+		return nil
+	}
+
+	// Traverse from top to layer 1
+	for lc := h.maxLayer; lc > 0; lc-- {
+		changed := true
+		for changed {
+			changed = false
+			if epNode.Connections == nil || lc >= len(epNode.Connections) {
+				break
+			}
+			for _, neighborID := range epNode.Connections[lc] {
+				neighbor := h.nodes[neighborID]
+				if neighbor == nil {
+					continue
+				}
+				if h.calc.Distance(query, neighbor.Vector) < h.calc.Distance(query, epNode.Vector) {
+					ep = neighborID
+					epNode = neighbor
+					changed = true
+				}
+			}
+		}
+	}
+
+	// Search at layer 0 with ef
+	candidates := h.searchLayer(query, ep, ef, 0)
+
+	// Return top k results
+	results := make([]core.SearchResult, 0, k)
+	for i := 0; i < len(candidates) && i < k; i++ {
+		node := h.nodes[candidates[i].nodeID]
+		if node == nil {
+			continue
+		}
+		score := candidates[i].distance
+		if h.config.Metric == distance.DotProduct {
+			score = -score
+		}
+		results = append(results, core.SearchResult{
+			ID:    node.VectorID,
+			Score: score,
+		})
+	}
+
+	return results
+}
+
+// InsertBatch inserts multiple vectors in a batch.
+// This is more efficient than inserting one by one as it allows for
+// better parallelization of the graph construction.
+func (h *HNSW) InsertBatch(vectors []*core.Vector) error {
+	if len(vectors) == 0 {
+		return nil
+	}
+
+	// For small batches, use sequential insertion
+	if len(vectors) < 100 {
+		for _, v := range vectors {
+			if err := h.Insert(v); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// For larger batches, insert first vector to initialize,
+	// then process remaining in parallel chunks
+	if err := h.Insert(vectors[0]); err != nil {
+		return err
+	}
+
+	// Process remaining vectors in chunks
+	remaining := vectors[1:]
+	chunkSize := 50
+	var wg sync.WaitGroup
+	errChan := make(chan error, (len(remaining)/chunkSize)+1)
+
+	for i := 0; i < len(remaining); i += chunkSize {
+		end := i + chunkSize
+		if end > len(remaining) {
+			end = len(remaining)
+		}
+		chunk := remaining[i:end]
+
+		wg.Add(1)
+		go func(vecs []*core.Vector) {
+			defer wg.Done()
+			for _, v := range vecs {
+				if err := h.Insert(v); err != nil {
+					select {
+					case errChan <- err:
+					default:
+					}
+					return
+				}
+			}
+		}(chunk)
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	// Return first error if any
+	for err := range errChan {
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// SearchWithFilter performs k-NN search with a filter function.
+// The filter function returns true for vectors that should be included.
+func (h *HNSW) SearchWithFilter(query []float32, k int, ef int, filter func(vectorID string) bool) []core.SearchResult {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if h.size == 0 || filter == nil {
+		return h.Search(query, k, ef)
+	}
+
+	// We need to search for more candidates since some will be filtered
+	searchK := k * 10
+	if searchK > int(h.size) {
+		searchK = int(h.size)
+	}
+
+	if ef < searchK {
+		ef = searchK
+	}
+
+	ep := h.entryPoint
+	epNode := h.nodes[ep]
+	if epNode == nil {
+		return nil
+	}
+
+	// Traverse from top to layer 1
+	for lc := h.maxLayer; lc > 0; lc-- {
+		changed := true
+		for changed {
+			changed = false
+			if epNode.Connections == nil || lc >= len(epNode.Connections) {
+				break
+			}
+			for _, neighborID := range epNode.Connections[lc] {
+				neighbor := h.nodes[neighborID]
+				if neighbor == nil {
+					continue
+				}
+				if h.calc.Distance(query, neighbor.Vector) < h.calc.Distance(query, epNode.Vector) {
+					ep = neighborID
+					epNode = neighbor
+					changed = true
+				}
+			}
+		}
+	}
+
+	// Search at layer 0 with ef
+	candidates := h.searchLayer(query, ep, ef, 0)
+
+	// Filter and return top k results
+	results := make([]core.SearchResult, 0, k)
+	for _, c := range candidates {
+		node := h.nodes[c.nodeID]
+		if node == nil {
+			continue
+		}
+		if !filter(node.VectorID) {
+			continue
+		}
+		score := c.distance
+		if h.config.Metric == distance.DotProduct {
+			score = -score
+		}
+		results = append(results, core.SearchResult{
+			ID:    node.VectorID,
+			Score: score,
+		})
+		if len(results) >= k {
+			break
+		}
+	}
+
+	return results
+}
+
+// ComputeRecall computes the recall against ground truth results.
+// This is useful for benchmarking and quality assessment.
+func ComputeRecall(predicted, groundTruth []core.SearchResult) float64 {
+	if len(groundTruth) == 0 {
+		return 0
+	}
+
+	gtSet := make(map[string]bool)
+	for _, r := range groundTruth {
+		gtSet[r.ID] = true
+	}
+
+	hits := 0
+	for _, r := range predicted {
+		if gtSet[r.ID] {
+			hits++
+		}
+	}
+
+	return float64(hits) / float64(len(groundTruth))
 }

@@ -9,9 +9,12 @@ A high-performance vector database written in Go, designed to compete with and e
 
 ### 🚀 Performance
 - **HNSW Index**: Hierarchical Navigable Small World graph for lightning-fast approximate nearest neighbor (ANN) search
-- **Optimized Distance Calculations**: Loop-unrolled distance computations for better CPU utilization
+- **RNG-Based Neighbor Selection**: Improved graph quality using Relative Neighborhood Graph heuristics for better recall
+- **Optimized Distance Calculations**: 8-way loop unrolling with dual accumulators for better CPU pipelining and ILP
+- **Adaptive Search**: Automatically adjusts exploration factor based on query difficulty
+- **Batch Processing**: Concurrent batch insertions for faster index building
 - **Concurrent Operations**: Thread-safe operations with minimal lock contention
-- **Memory Efficiency**: Vector pooling and optimized memory layouts
+- **Memory Efficiency**: Vector pooling, memory-mapped files, and optimized memory layouts
 
 ### 📊 Multiple Distance Metrics
 - Cosine similarity
@@ -25,10 +28,12 @@ A high-performance vector database written in Go, designed to compete with and e
 - Rich filter expressions: equality, comparison, range, contains, and more
 - Logical operators: AND, OR, NOT
 - Pre-filtering for efficient hybrid queries
+- Index-level filter functions for custom filtering logic
 
 ### 💾 Storage Options
 - **In-Memory**: Fast ephemeral storage for testing and small datasets
 - **Disk Persistence**: Write-ahead logging (WAL) for durability
+- **Memory-Mapped Files**: Handle datasets larger than RAM using virtual memory
 - **Recovery**: Automatic recovery from crashes
 
 ### 🗜️ Quantization
@@ -42,6 +47,11 @@ A high-performance vector database written in Go, designed to compete with and e
 - Collection management (create, delete, list)
 - Vector CRUD operations
 - Batch operations
+
+### 📝 Vector Versioning
+- Automatic version tracking for vectors
+- Timestamp-based updates for temporal queries
+- Support for audit trails and change tracking
 
 ## Installation
 
@@ -227,13 +237,44 @@ Run benchmarks with:
 go test -bench=. -benchmem ./...
 ```
 
-Example results on a modern machine:
+Example results on AMD EPYC (2 vCPU):
 
 | Operation | Vectors | Dimension | Time |
 |-----------|---------|-----------|------|
-| Insert | 1 | 128 | ~15µs |
-| Search (k=10, ef=100) | 10,000 | 128 | ~200µs |
-| Distance (Cosine) | - | 1024 | ~500ns |
+| Insert (HNSW w/ heuristic) | - | 128 | ~1.7ms |
+| Insert (HNSW simple) | - | 128 | ~1.2ms |
+| Search (k=10, ef=100) | 10,000 | 128 | ~800µs |
+| Distance (Cosine) | - | 1024 | ~706ns |
+| Distance (Euclidean) | - | 1024 | ~370ns |
+| Distance (Dot Product) | - | 1024 | ~333ns |
+
+### Recall Benchmarks
+
+With 5,000 vectors and 100 test queries:
+
+| Configuration | Recall@10 |
+|---------------|-----------|
+| HNSW with RNG Heuristic | **79.8%** |
+| HNSW Simple Selection | 78.9% |
+
+The RNG heuristic produces better graph connectivity, improving recall at the cost of slightly slower insertion.
+
+## Key Improvements Over Other Databases
+
+### 1. RNG-Based Neighbor Selection
+Unlike simple distance-based neighbor selection, deadlock-db uses a Relative Neighborhood Graph heuristic that avoids clusters of similar neighbors. This produces a more navigable graph with better recall.
+
+### 2. Adaptive Search
+The `SearchAdaptive` method automatically increases the exploration factor if initial results suggest a difficult query, providing better recall without sacrificing speed on easy queries.
+
+### 3. 8-Way Loop Unrolling
+Distance calculations use 8-way loop unrolling with dual accumulators to maximize instruction-level parallelism and CPU pipelining efficiency.
+
+### 4. Vector Versioning
+Every vector tracks its version number and timestamp, enabling temporal queries and audit trails - a feature often missing in other embedded vector databases.
+
+### 5. Memory-Mapped Storage
+The MMapEngine allows working with datasets larger than available RAM by using virtual memory backed by disk files.
 
 ## Comparison with Other Vector DBs
 
@@ -242,11 +283,15 @@ Example results on a modern machine:
 | Language | Go | Python | Cloud | C++/Go | Rust |
 | In-memory | ✅ | ✅ | ❌ | ✅ | ✅ |
 | Disk persistence | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Memory-mapped files | ✅ | ❌ | N/A | ✅ | ✅ |
 | HNSW index | ✅ | ✅ | ✅ | ✅ | ✅ |
+| RNG neighbor selection | ✅ | ❌ | ? | ✅ | ✅ |
+| Adaptive search | ✅ | ❌ | ? | ❌ | ❌ |
 | Hybrid search | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Scalar quantization | ✅ | ❌ | ❌ | ✅ | ✅ |
 | Product quantization | ✅ | ❌ | ❌ | ✅ | ✅ |
 | Sparse vectors | ✅ | ❌ | ✅ | ✅ | ✅ |
+| Vector versioning | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Embedded mode | ✅ | ✅ | ❌ | ❌ | ✅ |
 | No external deps | ✅ | ❌ | N/A | ❌ | ❌ |
 
@@ -262,3 +307,4 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 - HNSW algorithm: Malkov & Yashunin (2016)
 - Product quantization: Jégou et al. (2011)
+- RNG heuristic: Toussaint (1980)

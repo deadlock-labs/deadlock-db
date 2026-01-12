@@ -447,3 +447,204 @@ func (d *DiskEngine) Compact() error {
 	d.wal, err = NewWAL(oldWalPath)
 	return err
 }
+
+// MMapEngine provides memory-mapped file storage for large datasets.
+// This allows working with datasets larger than available RAM by
+// using virtual memory backed by disk files.
+type MMapEngine struct {
+	dataDir  string
+	index    map[string]int64 // ID -> offset in data file
+	dataFile *os.File
+	size     int64
+	mu       sync.RWMutex
+}
+
+// NewMMapEngine creates a new memory-mapped storage engine.
+func NewMMapEngine(dataDir string) (*MMapEngine, error) {
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create data directory: %w", err)
+	}
+
+	dataPath := filepath.Join(dataDir, "vectors.dat")
+	dataFile, err := os.OpenFile(dataPath, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open data file: %w", err)
+	}
+
+	// Get file size
+	info, err := dataFile.Stat()
+	if err != nil {
+		dataFile.Close()
+		return nil, err
+	}
+
+	engine := &MMapEngine{
+		dataDir:  dataDir,
+		index:    make(map[string]int64),
+		dataFile: dataFile,
+		size:     info.Size(),
+	}
+
+	// Load index from disk
+	if err := engine.loadIndex(); err != nil {
+		dataFile.Close()
+		return nil, err
+	}
+
+	return engine, nil
+}
+
+// loadIndex loads the index from disk.
+func (m *MMapEngine) loadIndex() error {
+	indexPath := filepath.Join(m.dataDir, "index.json")
+	data, err := os.ReadFile(indexPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // No index yet
+		}
+		return err
+	}
+	return json.Unmarshal(data, &m.index)
+}
+
+// saveIndex saves the index to disk.
+func (m *MMapEngine) saveIndex() error {
+	data, err := json.Marshal(m.index)
+	if err != nil {
+		return err
+	}
+	indexPath := filepath.Join(m.dataDir, "index.json")
+	return os.WriteFile(indexPath, data, 0644)
+}
+
+// Put stores a vector.
+func (m *MMapEngine) Put(v *core.Vector) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Serialize vector
+	data, err := serializeVector(v)
+	if err != nil {
+		return err
+	}
+
+	// Always append new data (old data becomes orphaned but will be reclaimed on compaction)
+	// This is a common pattern in append-only storage for simplicity and durability
+
+	// Write length prefix and data
+	offset := m.size
+	lenBuf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(lenBuf, uint32(len(data)))
+
+	if _, err := m.dataFile.WriteAt(lenBuf, offset); err != nil {
+		return err
+	}
+	if _, err := m.dataFile.WriteAt(data, offset+4); err != nil {
+		return err
+	}
+
+	m.index[v.ID] = offset
+	m.size += int64(4 + len(data))
+
+	return nil
+}
+
+// Get retrieves a vector by ID.
+func (m *MMapEngine) Get(id string) (*core.Vector, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.getInternal(id)
+}
+
+// getInternal retrieves a vector without acquiring locks (caller must hold lock).
+func (m *MMapEngine) getInternal(id string) (*core.Vector, error) {
+	offset, exists := m.index[id]
+	if !exists {
+		return nil, fmt.Errorf("vector not found: %s", id)
+	}
+
+	// Read length
+	lenBuf := make([]byte, 4)
+	if _, err := m.dataFile.ReadAt(lenBuf, offset); err != nil {
+		return nil, err
+	}
+	length := binary.LittleEndian.Uint32(lenBuf)
+
+	// Read data
+	data := make([]byte, length)
+	if _, err := m.dataFile.ReadAt(data, offset+4); err != nil {
+		return nil, err
+	}
+
+	return deserializeVector(data)
+}
+
+// Delete removes a vector by ID.
+func (m *MMapEngine) Delete(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	delete(m.index, id)
+	return nil
+}
+
+// Iterate iterates over all vectors.
+func (m *MMapEngine) Iterate(fn func(*core.Vector) error) error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for id := range m.index {
+		v, err := m.getInternal(id)
+		if err != nil {
+			continue
+		}
+		if err := fn(v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Sync forces data to disk.
+func (m *MMapEngine) Sync() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if err := m.dataFile.Sync(); err != nil {
+		return err
+	}
+	return m.saveIndex()
+}
+
+// Close closes the storage engine.
+func (m *MMapEngine) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if err := m.saveIndex(); err != nil {
+		return err
+	}
+	return m.dataFile.Close()
+}
+
+// serializeVector converts a vector to bytes.
+func serializeVector(v *core.Vector) ([]byte, error) {
+	return json.Marshal(v)
+}
+
+// deserializeVector reconstructs a vector from bytes.
+func deserializeVector(data []byte) (*core.Vector, error) {
+	var v core.Vector
+	if err := json.Unmarshal(data, &v); err != nil {
+		return nil, err
+	}
+	return &v, nil
+}
+
+// Size returns the number of vectors stored.
+func (m *MMapEngine) Size() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.index)
+}

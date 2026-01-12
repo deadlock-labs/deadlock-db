@@ -6,14 +6,17 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"time"
 )
 
 // Vector represents a dense vector with an ID and optional metadata.
 type Vector struct {
-	ID       string            `json:"id"`
-	Values   []float32         `json:"values"`
-	Metadata map[string]any    `json:"metadata,omitempty"`
-	Sparse   *SparseVector     `json:"sparse,omitempty"`
+	ID        string         `json:"id"`
+	Values    []float32      `json:"values"`
+	Metadata  map[string]any `json:"metadata,omitempty"`
+	Sparse    *SparseVector  `json:"sparse,omitempty"`
+	Version   int64          `json:"version,omitempty"`   // Auto-incrementing version number
+	Timestamp int64          `json:"timestamp,omitempty"` // Unix nanoseconds when created/updated
 }
 
 // SparseVector represents a sparse vector using indices and values.
@@ -25,18 +28,22 @@ type SparseVector struct {
 // NewVector creates a new vector with the given ID and values.
 func NewVector(id string, values []float32) *Vector {
 	return &Vector{
-		ID:       id,
-		Values:   values,
-		Metadata: make(map[string]any),
+		ID:        id,
+		Values:    values,
+		Metadata:  make(map[string]any),
+		Version:   1,
+		Timestamp: time.Now().UnixNano(),
 	}
 }
 
 // NewVectorWithMetadata creates a new vector with metadata.
 func NewVectorWithMetadata(id string, values []float32, metadata map[string]any) *Vector {
 	return &Vector{
-		ID:       id,
-		Values:   values,
-		Metadata: metadata,
+		ID:        id,
+		Values:    values,
+		Metadata:  metadata,
+		Version:   1,
+		Timestamp: time.Now().UnixNano(),
 	}
 }
 
@@ -48,9 +55,11 @@ func (v *Vector) Dimension() int {
 // Clone creates a deep copy of the vector.
 func (v *Vector) Clone() *Vector {
 	clone := &Vector{
-		ID:       v.ID,
-		Values:   make([]float32, len(v.Values)),
-		Metadata: make(map[string]any, len(v.Metadata)),
+		ID:        v.ID,
+		Values:    make([]float32, len(v.Values)),
+		Metadata:  make(map[string]any, len(v.Metadata)),
+		Version:   v.Version,
+		Timestamp: v.Timestamp,
 	}
 	copy(clone.Values, v.Values)
 	for k, val := range v.Metadata {
@@ -65,6 +74,13 @@ func (v *Vector) Clone() *Vector {
 		copy(clone.Sparse.Values, v.Sparse.Values)
 	}
 	return clone
+}
+
+// IncrementVersion increments the version and updates the timestamp.
+// Call this when updating a vector.
+func (v *Vector) IncrementVersion() {
+	v.Version++
+	v.Timestamp = time.Now().UnixNano()
 }
 
 // Normalize normalizes the vector to unit length (L2 norm).
