@@ -1,4 +1,4 @@
-# deadlock-db
+# deadlock-db (In Development)
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/deadlock-labs/deadlock-db.svg)](https://pkg.go.dev/github.com/deadlock-labs/deadlock-db)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
