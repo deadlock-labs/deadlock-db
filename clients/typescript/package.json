@@ -1,0 +1,30 @@
+{
+  "name": "deadlockdb",
+  "version": "0.1.0",
+  "description": "TypeScript/JavaScript client for deadlock-db vector database",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test tests/client.test.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "vector-database",
+    "similarity-search",
+    "embeddings",
+    "hnsw"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/deadlock-labs/deadlock-db"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}
