@@ -95,12 +95,16 @@ func (c *CosineCalculator) Distance(a, b []float32) float32 {
 // Metric returns Cosine.
 func (c *CosineCalculator) Metric() Metric { return Cosine }
 
-// EuclideanCalculator calculates Euclidean (L2) distance.
+// EuclideanCalculator calculates squared Euclidean (L2²) distance.
+// Using squared distance avoids the expensive sqrt while preserving
+// the relative ordering needed by HNSW — this is a key optimization
+// used by high-performance vector databases like Qdrant and Milvus.
 type EuclideanCalculator struct{}
 
-// Distance calculates the Euclidean distance.
+// Distance returns the squared Euclidean distance (no sqrt).
+// Squared distance preserves ordering: if d(a,c) < d(b,c) then d²(a,c) < d²(b,c).
 func (e *EuclideanCalculator) Distance(a, b []float32) float32 {
-	return EuclideanDistance(a, b)
+	return EuclideanDistanceSquared(a, b)
 }
 
 // Metric returns Euclidean.

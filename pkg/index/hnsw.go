@@ -5,6 +5,7 @@ import (
 	"container/heap"
 	"math"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -55,12 +56,13 @@ type HNSWNode struct {
 
 // NewHNSWNode creates a new HNSW node.
 func NewHNSWNode(id uint64, vectorID string, vector []float32, maxLevel int) *HNSWNode {
-	return &HNSWNode{
+	node := &HNSWNode{
 		ID:          id,
 		VectorID:    vectorID,
 		Vector:      vector,
 		Connections: make([][]uint64, maxLevel+1),
 	}
+	return node
 }
 
 // HNSW implements the Hierarchical Navigable Small World graph for ANN search.
@@ -133,7 +135,8 @@ func (h *HNSW) Insert(v *core.Vector) error {
 	ep := h.entryPoint
 	epNode := h.nodes[ep]
 
-	// Start from top layer and go down
+	// Start from top layer and go down, caching entry point distance
+	epDist := h.calc.Distance(v.Values, epNode.Vector)
 	for lc := h.maxLayer; lc > level; lc-- {
 		changed := true
 		for changed {
@@ -146,9 +149,11 @@ func (h *HNSW) Insert(v *core.Vector) error {
 				if neighbor == nil {
 					continue
 				}
-				if h.calc.Distance(v.Values, neighbor.Vector) < h.calc.Distance(v.Values, epNode.Vector) {
+				nDist := h.calc.Distance(v.Values, neighbor.Vector)
+				if nDist < epDist {
 					ep = neighborID
 					epNode = neighbor
+					epDist = nDist
 					changed = true
 				}
 			}
@@ -228,9 +233,11 @@ func (h *HNSW) Delete(vectorID string) error {
 		return nil
 	}
 
-	// Remove connections to this node from all neighbors
+	// Remove connections to this node from all neighbors and
+	// attempt graph repair by connecting former neighbors to each other.
 	for lc := 0; lc < len(node.Connections); lc++ {
-		for _, neighborID := range node.Connections[lc] {
+		neighbors := node.Connections[lc]
+		for _, neighborID := range neighbors {
 			neighbor := h.nodes[neighborID]
 			if neighbor == nil {
 				continue
@@ -247,18 +254,55 @@ func (h *HNSW) Delete(vectorID string) error {
 			}
 			neighbor.mu.Unlock()
 		}
+
+		// Graph repair: try to reconnect orphaned neighbors
+		for _, nID := range neighbors {
+			nNode := h.nodes[nID]
+			if nNode == nil {
+				continue
+			}
+			nNode.mu.Lock()
+			if lc < len(nNode.Connections) && len(nNode.Connections[lc]) < h.config.M/2 {
+				// This neighbor lost connectivity; try connecting it to
+				// other former neighbors of the deleted node.
+				existingSet := make(map[uint64]bool, len(nNode.Connections[lc]))
+				for _, id := range nNode.Connections[lc] {
+					existingSet[id] = true
+				}
+				for _, otherID := range neighbors {
+					if otherID == nID || existingSet[otherID] {
+						continue
+					}
+					if h.nodes[otherID] == nil {
+						continue
+					}
+					nNode.Connections[lc] = append(nNode.Connections[lc], otherID)
+					if len(nNode.Connections[lc]) >= h.config.M*2 {
+						break
+					}
+				}
+			}
+			nNode.mu.Unlock()
+		}
 	}
 
 	delete(h.nodes, nodeID)
 	delete(h.vectorToID, vectorID)
 	atomic.AddUint64(&h.size, ^uint64(0)) // Decrement
 
-	// Update entry point if necessary
+	// Update entry point if necessary — pick the node with the highest layer
 	if h.entryPoint == nodeID && len(h.nodes) > 0 {
-		for id := range h.nodes {
-			h.entryPoint = id
-			break
+		bestID := uint64(0)
+		bestLayer := -1
+		for id, n := range h.nodes {
+			nodeMaxLayer := len(n.Connections) - 1
+			if nodeMaxLayer > bestLayer {
+				bestLayer = nodeMaxLayer
+				bestID = id
+			}
 		}
+		h.entryPoint = bestID
+		h.maxLayer = bestLayer
 	}
 
 	return nil
@@ -273,39 +317,68 @@ type candidate struct {
 // candidateHeap implements a min-heap for candidates.
 type candidateHeap []candidate
 
-func (h candidateHeap) Len() int           { return len(h) }
-func (h candidateHeap) Less(i, j int) bool { return h[i].distance < h[j].distance }
-func (h candidateHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (ch candidateHeap) Len() int           { return len(ch) }
+func (ch candidateHeap) Less(i, j int) bool { return ch[i].distance < ch[j].distance }
+func (ch candidateHeap) Swap(i, j int)      { ch[i], ch[j] = ch[j], ch[i] }
 
-func (h *candidateHeap) Push(x any) {
-	*h = append(*h, x.(candidate))
+func (ch *candidateHeap) Push(x any) {
+	*ch = append(*ch, x.(candidate))
 }
 
-func (h *candidateHeap) Pop() any {
-	old := *h
+func (ch *candidateHeap) Pop() any {
+	old := *ch
 	n := len(old)
 	x := old[n-1]
-	*h = old[0 : n-1]
+	*ch = old[0 : n-1]
 	return x
 }
 
 // maxCandidateHeap implements a max-heap for candidates (for ef results).
 type maxCandidateHeap []candidate
 
-func (h maxCandidateHeap) Len() int           { return len(h) }
-func (h maxCandidateHeap) Less(i, j int) bool { return h[i].distance > h[j].distance }
-func (h maxCandidateHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (ch maxCandidateHeap) Len() int           { return len(ch) }
+func (ch maxCandidateHeap) Less(i, j int) bool { return ch[i].distance > ch[j].distance }
+func (ch maxCandidateHeap) Swap(i, j int)      { ch[i], ch[j] = ch[j], ch[i] }
 
-func (h *maxCandidateHeap) Push(x any) {
-	*h = append(*h, x.(candidate))
+func (ch *maxCandidateHeap) Push(x any) {
+	*ch = append(*ch, x.(candidate))
 }
 
-func (h *maxCandidateHeap) Pop() any {
-	old := *h
+func (ch *maxCandidateHeap) Pop() any {
+	old := *ch
 	n := len(old)
 	x := old[n-1]
-	*h = old[0 : n-1]
+	*ch = old[0 : n-1]
 	return x
+}
+
+// visitedSet is a fast bitset for tracking visited nodes during search.
+// It replaces map[uint64]bool to eliminate hash-map overhead on the hot path.
+type visitedSet struct {
+	bits []uint64
+}
+
+func newVisitedSet(capacity uint64) *visitedSet {
+	return &visitedSet{bits: make([]uint64, (capacity/64)+1)}
+}
+
+func (v *visitedSet) set(id uint64) {
+	idx := id / 64
+	if idx >= uint64(len(v.bits)) {
+		// Grow the bitset
+		newBits := make([]uint64, idx+1)
+		copy(newBits, v.bits)
+		v.bits = newBits
+	}
+	v.bits[idx] |= 1 << (id % 64)
+}
+
+func (v *visitedSet) test(id uint64) bool {
+	idx := id / 64
+	if idx >= uint64(len(v.bits)) {
+		return false
+	}
+	return v.bits[idx]&(1<<(id%64)) != 0
 }
 
 // searchLayer performs a greedy search at a single layer.
@@ -315,8 +388,8 @@ func (h *HNSW) searchLayer(query []float32, ep uint64, ef int, layer int) []cand
 		return nil
 	}
 
-	visited := make(map[uint64]bool)
-	visited[ep] = true
+	visited := newVisitedSet(atomic.LoadUint64(&h.nextID))
+	visited.set(ep)
 
 	candidates := &candidateHeap{}
 	results := &maxCandidateHeap{}
@@ -339,10 +412,10 @@ func (h *HNSW) searchLayer(query []float32, ep uint64, ef int, layer int) []cand
 		}
 
 		for _, neighborID := range cNode.Connections[layer] {
-			if visited[neighborID] {
+			if visited.test(neighborID) {
 				continue
 			}
-			visited[neighborID] = true
+			visited.set(neighborID)
 
 			neighbor := h.nodes[neighborID]
 			if neighbor == nil {
@@ -401,39 +474,33 @@ func (h *HNSW) selectNeighborsHeuristic(query []float32, candidates []candidate,
 		return nil
 	}
 
+	// Sort candidates by distance for efficient iteration.
+	sorted := make([]candidate, len(candidates))
+	copy(sorted, candidates)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].distance < sorted[j].distance
+	})
+
 	selected := make([]candidate, 0, m)
-	// Working set starts with all candidates
-	working := make([]candidate, len(candidates))
-	copy(working, candidates)
 
-	for len(selected) < m && len(working) > 0 {
-		// Find the closest candidate to query
-		minIdx := 0
-		for i := 1; i < len(working); i++ {
-			if working[i].distance < working[minIdx].distance {
-				minIdx = i
-			}
+	for _, c := range sorted {
+		if len(selected) >= m {
+			break
 		}
-		closest := working[minIdx]
-
-		// Remove from working set
-		working[minIdx] = working[len(working)-1]
-		working = working[:len(working)-1]
-
 		// Check if this candidate is a good addition (RNG condition)
 		// A candidate is good if it's not dominated by existing selected neighbors
 		good := true
-		closestNode := h.nodes[closest.nodeID]
-		if closestNode != nil {
+		cNode := h.nodes[c.nodeID]
+		if cNode != nil {
 			for _, sel := range selected {
 				selNode := h.nodes[sel.nodeID]
 				if selNode == nil {
 					continue
 				}
-				// If distance(closest, sel) < distance(query, closest),
-				// then 'sel' dominates 'closest' for this query
-				distToSel := h.calc.Distance(closestNode.Vector, selNode.Vector)
-				if distToSel < closest.distance {
+				// If distance(c, sel) < distance(query, c),
+				// then 'sel' dominates 'c' for this query
+				distToSel := h.calc.Distance(cNode.Vector, selNode.Vector)
+				if distToSel < c.distance {
 					good = false
 					break
 				}
@@ -441,24 +508,21 @@ func (h *HNSW) selectNeighborsHeuristic(query []float32, candidates []candidate,
 		}
 
 		if good {
-			selected = append(selected, closest)
+			selected = append(selected, c)
 		}
 	}
 
 	// If we couldn't fill M neighbors with the heuristic, fill with remaining best
-	if len(selected) < m && len(candidates) > len(selected) {
-		for _, c := range candidates {
+	if len(selected) < m {
+		selectedSet := make(map[uint64]bool, len(selected))
+		for _, s := range selected {
+			selectedSet[s.nodeID] = true
+		}
+		for _, c := range sorted {
 			if len(selected) >= m {
 				break
 			}
-			found := false
-			for _, s := range selected {
-				if s.nodeID == c.nodeID {
-					found = true
-					break
-				}
-			}
-			if !found {
+			if !selectedSet[c.nodeID] {
 				selected = append(selected, c)
 			}
 		}
@@ -468,7 +532,7 @@ func (h *HNSW) selectNeighborsHeuristic(query []float32, candidates []candidate,
 }
 
 // pruneConnections reduces the number of connections to maxConnections.
-// Uses the same heuristic as selectNeighbors for consistency.
+// Uses sort.Slice for O(n log n) instead of O(n²) bubble sort.
 func (h *HNSW) pruneConnections(node *HNSWNode, layer int, maxConnections int) []uint64 {
 	if layer >= len(node.Connections) || len(node.Connections[layer]) <= maxConnections {
 		return node.Connections[layer]
@@ -491,14 +555,10 @@ func (h *HNSW) pruneConnections(node *HNSWNode, layer int, maxConnections int) [
 		})
 	}
 
-	// Sort by distance
-	for i := 0; i < len(neighbors)-1; i++ {
-		for j := i + 1; j < len(neighbors); j++ {
-			if neighbors[j].dist < neighbors[i].dist {
-				neighbors[i], neighbors[j] = neighbors[j], neighbors[i]
-			}
-		}
-	}
+	// Sort by distance using sort.Slice — O(n log n)
+	sort.Slice(neighbors, func(i, j int) bool {
+		return neighbors[i].dist < neighbors[j].dist
+	})
 
 	if !h.config.UseHeuristic {
 		// Simple: keep only the closest
@@ -537,18 +597,15 @@ func (h *HNSW) pruneConnections(node *HNSWNode, layer int, maxConnections int) [
 
 	// Fill remaining slots if needed
 	if len(result) < maxConnections {
+		resultSet := make(map[uint64]bool, len(result))
+		for _, id := range result {
+			resultSet[id] = true
+		}
 		for _, neighbor := range neighbors {
 			if len(result) >= maxConnections {
 				break
 			}
-			found := false
-			for _, id := range result {
-				if id == neighbor.id {
-					found = true
-					break
-				}
-			}
-			if !found {
+			if !resultSet[neighbor.id] {
 				result = append(result, neighbor.id)
 			}
 		}
@@ -576,7 +633,8 @@ func (h *HNSW) Search(query []float32, k int, ef int) []core.SearchResult {
 		return nil
 	}
 
-	// Traverse from top to layer 1
+	// Traverse from top to layer 1, caching EP distance
+	epDist := h.calc.Distance(query, epNode.Vector)
 	for lc := h.maxLayer; lc > 0; lc-- {
 		changed := true
 		for changed {
@@ -589,9 +647,11 @@ func (h *HNSW) Search(query []float32, k int, ef int) []core.SearchResult {
 				if neighbor == nil {
 					continue
 				}
-				if h.calc.Distance(query, neighbor.Vector) < h.calc.Distance(query, epNode.Vector) {
+				nDist := h.calc.Distance(query, neighbor.Vector)
+				if nDist < epDist {
 					ep = neighborID
 					epNode = neighbor
+					epDist = nDist
 					changed = true
 				}
 			}
@@ -794,7 +854,8 @@ func (h *HNSW) searchInternal(query []float32, k int, ef int) []core.SearchResul
 		return nil
 	}
 
-	// Traverse from top to layer 1
+	// Traverse from top to layer 1, caching EP distance
+	epDist := h.calc.Distance(query, epNode.Vector)
 	for lc := h.maxLayer; lc > 0; lc-- {
 		changed := true
 		for changed {
@@ -807,9 +868,11 @@ func (h *HNSW) searchInternal(query []float32, k int, ef int) []core.SearchResul
 				if neighbor == nil {
 					continue
 				}
-				if h.calc.Distance(query, neighbor.Vector) < h.calc.Distance(query, epNode.Vector) {
+				nDist := h.calc.Distance(query, neighbor.Vector)
+				if nDist < epDist {
 					ep = neighborID
 					epNode = neighbor
+					epDist = nDist
 					changed = true
 				}
 			}
@@ -930,7 +993,8 @@ func (h *HNSW) SearchWithFilter(query []float32, k int, ef int, filter func(vect
 		return nil
 	}
 
-	// Traverse from top to layer 1
+	// Traverse from top to layer 1, caching EP distance
+	epDist := h.calc.Distance(query, epNode.Vector)
 	for lc := h.maxLayer; lc > 0; lc-- {
 		changed := true
 		for changed {
@@ -943,9 +1007,11 @@ func (h *HNSW) SearchWithFilter(query []float32, k int, ef int, filter func(vect
 				if neighbor == nil {
 					continue
 				}
-				if h.calc.Distance(query, neighbor.Vector) < h.calc.Distance(query, epNode.Vector) {
+				nDist := h.calc.Distance(query, neighbor.Vector)
+				if nDist < epDist {
 					ep = neighborID
 					epNode = neighbor
+					epDist = nDist
 					changed = true
 				}
 			}

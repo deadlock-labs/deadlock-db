@@ -203,13 +203,45 @@ func (c *Collection) Insert(v *core.Vector) error {
 	return nil
 }
 
-// InsertBatch inserts multiple vectors.
+// InsertBatch inserts multiple vectors efficiently.
+// It validates all vectors first, then delegates to the HNSW batch inserter
+// for better throughput on large batches.
 func (c *Collection) InsertBatch(vectors []*core.Vector) error {
+	if len(vectors) == 0 {
+		return nil
+	}
+
+	// Validate all vectors first
 	for _, v := range vectors {
-		if err := c.Insert(v); err != nil {
-			return err
+		if v == nil {
+			return fmt.Errorf("vector is nil")
+		}
+		if len(v.Values) != c.config.Dimension {
+			return fmt.Errorf("dimension mismatch: expected %d, got %d", c.config.Dimension, len(v.Values))
 		}
 	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Store to storage and collect metadata
+	for _, v := range vectors {
+		if err := c.storage.Put(v); err != nil {
+			return fmt.Errorf("failed to store vector: %w", err)
+		}
+		if v.Metadata != nil {
+			c.metadata[v.ID] = v.Metadata
+		}
+	}
+
+	// Batch insert into HNSW index
+	if err := c.index.InsertBatch(vectors); err != nil {
+		return fmt.Errorf("failed to index batch: %w", err)
+	}
+
+	atomic.AddUint64(&c.count, uint64(len(vectors)))
+	c.updated = time.Now()
+
 	return nil
 }
 
