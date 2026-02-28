@@ -36,13 +36,13 @@ func TestLargeScaleDataset(t *testing.T) {
 	// ---------------------------------------------------------------
 	// 1. Generate dataset
 	// ---------------------------------------------------------------
-	rand.Seed(42)
+	rng := rand.New(rand.NewSource(42))
 	vectors := make([][]float32, numVectors)
 	ids := make([]string, numVectors)
 	for i := 0; i < numVectors; i++ {
 		vectors[i] = make([]float32, dim)
 		for j := 0; j < dim; j++ {
-			vectors[i][j] = rand.Float32()*2 - 1
+			vectors[i][j] = rng.Float32()*2 - 1
 		}
 		ids[i] = fmt.Sprintf("vec-%d", i)
 	}
@@ -84,7 +84,7 @@ func TestLargeScaleDataset(t *testing.T) {
 	for q := 0; q < numQueries; q++ {
 		queries[q] = make([]float32, dim)
 		for j := 0; j < dim; j++ {
-			queries[q][j] = rand.Float32()*2 - 1
+			queries[q][j] = rng.Float32()*2 - 1
 		}
 	}
 
@@ -139,14 +139,14 @@ func TestLargeScaleDataset(t *testing.T) {
 	// 7. Conclusion
 	// ---------------------------------------------------------------
 	t.Logf("")
-	t.Logf("=== Competitive Analysis Conclusion ===")
+	t.Logf("=== Competitive Analysis Conclusion (estimated) ===")
 	t.Logf("deadlock-db (Go, embedded, zero external deps):")
-	t.Logf("  • Insert  : %.0f vec/sec – comparable to ChromaDB, faster than pure-Python libs", insertPerSec)
-	t.Logf("  • Search  : %v avg latency, %.0f QPS – competitive with Qdrant/Milvus for small–mid datasets", avgSearch, searchQPS)
-	t.Logf("  • Recall  : %.1f%% – on par with other HNSW implementations (ChromaDB, Qdrant)", avgRecall*100)
-	t.Logf("  • Memory  : %.1f MB for %d vectors – efficient due to zero-copy Go slices", allocMB, numVectors)
-	t.Logf("  • Unique  : embedded mode, no external dependencies, vector versioning, adaptive search")
-	t.Logf("  • Trade-offs vs managed (Pinecone): no auto-scaling, no multi-tenancy, but zero ops cost")
+	t.Logf("  • Insert  : %.0f vec/sec", insertPerSec)
+	t.Logf("  • Search  : %v avg latency, %.0f QPS", avgSearch, searchQPS)
+	t.Logf("  • Recall  : %.1f%%", avgRecall*100)
+	t.Logf("  • Memory  : %.1f MB for %d vectors", allocMB, numVectors)
+	t.Logf("  • Strengths: embedded mode, no external deps, vector versioning, adaptive search")
+	t.Logf("  • Trade-offs vs managed (Pinecone): no auto-scaling or multi-tenancy, but zero ops cost")
 	t.Logf("  • Trade-offs vs Milvus: no GPU acceleration or distributed mode, but simpler deployment")
 
 	// Basic sanity checks
