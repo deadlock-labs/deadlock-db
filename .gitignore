@@ -30,3 +30,18 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+
+# Node.js / TypeScript
+node_modules/
+*.js.map
+*.d.ts.map
