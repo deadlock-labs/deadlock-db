@@ -198,6 +198,8 @@ curl -X DELETE http://localhost:8080/collections/my-vectors
 
 ### Python Client
 
+> 📖 Full setup & publishing guide: [`docs/python-client.md`](docs/python-client.md)
+
 ```bash
 pip install clients/python   # from repo root
 ```
@@ -224,7 +226,11 @@ for r in results:
 results = client.search("embeddings", vector=[0.15] * 128, k=5, filter={"category": "tech"})
 ```
 
+> See [`examples/python/basic.py`](examples/python/basic.py) for a complete runnable example.
+
 ### TypeScript / JavaScript Client
+
+> 📖 Full setup & publishing guide: [`docs/typescript-client.md`](docs/typescript-client.md)
 
 ```bash
 npm install clients/typescript   # from repo root
@@ -249,6 +255,8 @@ const results = await client.search("embeddings", Array(128).fill(0.15), 5);
 // Filtered search
 const filtered = await client.search("embeddings", Array(128).fill(0.15), 5, { category: "tech" });
 ```
+
+> See [`examples/typescript/basic.ts`](examples/typescript/basic.ts) for a complete runnable example.
 
 ## Configuration
 
@@ -283,6 +291,17 @@ deadlock-db/
 │   └── api/           # HTTP server
 ├── cmd/
 │   └── deadlock-db/   # CLI application
+├── clients/
+│   ├── python/        # Python client (pip install)
+│   └── typescript/    # TypeScript client (npm install)
+├── docs/
+│   ├── python-client.md      # Python setup & publishing guide
+│   └── typescript-client.md  # TypeScript setup & publishing guide
+├── examples/
+│   ├── basic/         # Basic Go example
+│   ├── advanced/      # Advanced Go example
+│   ├── python/        # Python client example
+│   └── typescript/    # TypeScript client example
 └── deadlockdb.go      # Main database interface
 ```
 
