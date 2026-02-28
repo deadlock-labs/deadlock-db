@@ -255,7 +255,11 @@ func (h *HNSW) Delete(vectorID string) error {
 			neighbor.mu.Unlock()
 		}
 
-		// Graph repair: try to reconnect orphaned neighbors
+		// Graph repair: try to reconnect orphaned neighbors.
+		// If a neighbor has fewer than M/2 connections (half of the target),
+		// it has lost significant connectivity and should be reconnected
+		// to other former neighbors of the deleted node to maintain
+		// graph navigability.
 		for _, nID := range neighbors {
 			nNode := h.nodes[nID]
 			if nNode == nil {
@@ -359,6 +363,9 @@ type visitedSet struct {
 }
 
 func newVisitedSet(capacity uint64) *visitedSet {
+	if capacity == 0 {
+		return &visitedSet{bits: nil}
+	}
 	return &visitedSet{bits: make([]uint64, (capacity/64)+1)}
 }
 
